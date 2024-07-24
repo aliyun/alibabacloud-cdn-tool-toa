@@ -8,7 +8,7 @@ It only supports IPv4 yet.
 
 ## Requirements
 
-The kernel module only supports Linux v2.6.32-v3.10.0 yet, such as CentOS 6.5/7.2/7.7.
+The kernel module supports kernel from 2.6.32 to 5.10.134.
 To compile the kernel module, the environment requirements are as below:
 
 - Kernel devel and related packages

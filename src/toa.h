@@ -19,7 +19,7 @@
 #ifndef __TCP_TOA_H__
 #define __TCP_TOA_H__
 
-#define TOA_VERSION "1.0.0"
+#define TOA_VERSION "2.0.0"
 
 #ifdef TOA_DEBUG_ENABLE
 #define TOA_DBG(msg...) do {			\
@@ -36,7 +36,7 @@
 
 #define TCPOPT_TOA	28
 #define TOA_IPV4	1
-#define TOA_V4_LEN	8
+#define TOA_V4_LEN	7
 
 struct toa_data {
 	__u8 opcode;
@@ -84,5 +84,11 @@ struct toa_stat_mib {
 
 #define TOA_INC_STATS(mib, field)	\
 	(per_cpu_ptr(mib, smp_processor_id())->mibs[field]++)
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
+#define req_wndclp (req->window_clamp)
+#else
+#define req_wndclp (req->rsk_window_clamp)
+#endif
 
 #endif

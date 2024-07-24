@@ -35,8 +35,16 @@
 #include <net/tcp.h>
 #include <net/ipv6.h>
 #include <net/transp_v6.h>
+#include <net/route.h>
 
 #include "toa.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+#include <linux/kprobes.h>
+static struct kprobe kp = {
+	.symbol_name = "kallsyms_lookup_name"
+};
+#endif
 
 /* statistics of toa in proc /proc/net/toa_stats */
 struct toa_stats_entry toa_stats[] = {
@@ -53,9 +61,10 @@ DEFINE_TOA_STAT(struct toa_stat_mib, ext_stats);
 
 static struct proto *ptr_tcp_prot;
 
-extern unsigned long __weak kallsyms_lookup_name(const char *name);
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 static kallsyms_lookup_name_t ptr_kallsyms_lookup_name;
+
+static struct proc_dir_entry *proc_toa_stat;
 
 #define U32_MAX ((u32)~0U)
 
@@ -101,7 +110,7 @@ static int get_toa_data(struct sk_buff *skb, __be32 *in)
 					/* don't parse partial options */
 					return TOA_NOT_FOUND;
 				if (opcode == TCPOPT_TOA) {
-					if (*ptr == TOA_IPV4 && opsize == TOA_V4_LEN - 1 && in) {
+					if (*ptr == TOA_IPV4 && opsize == TOA_V4_LEN && in) {
 						memcpy(in, ptr + 1, sizeof(__be32));
 						TOA_DBG("coded ip4 toa data: %pI4c\n", ptr + 1);
 						return TOA_IPV4_FOUND;
@@ -124,8 +133,13 @@ static int get_toa_data(struct sk_buff *skb, __be32 *in)
  *                        try to get local address
  * @return return what the original inet_getname() returns.
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
 static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
 		int *uaddr_len, int peer)
+#else
+static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
+		int peer)
+#endif
 {
 	int retval = 0;
 	struct sock *sk = sock->sk;
@@ -136,16 +150,25 @@ static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
 		sk->sk_user_data);
 
 	/* call orginal one */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
 	retval = inet_getname(sock, uaddr, uaddr_len, peer);
+#else
+	retval = inet_getname(sock, uaddr, peer);
+#endif
+
 
 	/* set our value if need */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
 	if (!retval && sock_flag(sk, SOCK_TOA_IPV4) &&
+#else
+	if (retval > 0 && sock_flag(sk, SOCK_TOA_IPV4) &&
+#endif
 		sk->sk_user_data && peer) {
 		if (sk->sk_family == AF_INET && sk->sk_type == SOCK_STREAM &&
 		    sk->sk_prot == ptr_tcp_prot) {
 			tdata = (struct toa_data*)&sk->sk_user_data;
 			if (tdata->opcode == TCPOPT_TOA &&
-			    tdata->opsize == TOA_V4_LEN - 1 &&
+			    tdata->opsize == TOA_V4_LEN &&
 			    tdata->opversion == TOA_IPV4) {
 				TOA_INC_STATS(ext_stats, GETNAME_TOA_OK_CNT);
 				TOA_DBG("inet_getname_toa: set new sockaddr, ip "
@@ -174,35 +197,47 @@ static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
  * @param dst [out] route cache entry
  * @return NULL if fail new socket if succeed.
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 static struct sock* tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
 			struct request_sock *req, struct dst_entry *dst)
+#else
+static struct sock *tcp_v4_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+			struct request_sock *req, struct dst_entry *dst,
+			struct request_sock *req_unhash, bool *own_req)
+#endif
 {
 	struct sock *newsock = NULL;
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct toa_data tdata;
-	__be32 ip = req->window_clamp;
+	__be32 ip = req_wndclp;
 	void *ptr = NULL;
 
 	TOA_DBG("tcp_v4_syn_recv_sock_toa called\n");
 
 	if (tp->window_clamp)
-		req->window_clamp = tp->window_clamp;
+		req_wndclp = tp->window_clamp;
 	else
-		req->window_clamp = 0;
+		req_wndclp = 0;
 
 	/* copy from tcp_select_initial_window() */
-	if (req->window_clamp == 0)
-		req->window_clamp = 65535U << 14;
-	req->window_clamp = min_t(u32, req->window_clamp, tcp_full_space(sk));
-	req->window_clamp = min(65535U << inet_rsk(req)->rcv_wscale, req->window_clamp);
+	if (req_wndclp == 0)
+		req_wndclp = 65535U << 14;
 
+	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK)
+		req_wndclp = min_t(u32, req_wndclp, tcp_full_space(sk));
+
+	req_wndclp = min(65535U << inet_rsk(req)->rcv_wscale, req_wndclp);
 	TOA_DBG("t4srst req: %p, tcp_wnd_clp: %u, wnd_clp: %u\n",
-		req, tp->window_clamp, req->window_clamp);
+		req, tp->window_clamp, req_wndclp);
 
-	WARN_ON_ONCE(!req->window_clamp);
+	WARN_ON_ONCE(!req_wndclp);
 
 	/* call orginal one */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 	newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst);
+#else
+	newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst, req_unhash, own_req);
+#endif
 
 	/* clear TOA flag */
 	if (newsock)
@@ -214,7 +249,7 @@ static struct sock* tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *sk
 	    !newsock->sk_user_data) {
 		if (ip != 65535U) {
 			tdata.opcode = TCPOPT_TOA;
-			tdata.opsize = TOA_V4_LEN - 1;
+			tdata.opsize = TOA_V4_LEN;
 			tdata.opversion = TOA_IPV4;
 			tdata.ip = ip;
 			memcpy(&ptr, &tdata, sizeof(struct toa_data));
@@ -248,14 +283,27 @@ static int tcp_v4_conn_request_toa(struct sock *sk, struct sk_buff *skb)
 
 	if (!ret && sk->sk_family == AF_INET && sk->sk_type == SOCK_STREAM &&
 	    sk->sk_prot == ptr_tcp_prot) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 		req = inet_csk_search_req(sk, &prev, th->source, iph->saddr, iph->daddr);
+#else
+		if (unlikely(!skb_dst(skb))) {
+			TOA_INFO("There is not destination route entry in skb\n");
+			return ret;
+		}
+		req = (struct request_sock *)inet_lookup_established(dev_net(skb_dst(skb)->dev),
+											&tcp_hashinfo, iph->saddr, th->source,
+											iph->daddr, th->dest, inet_iif(skb));
+ #endif
 		if (req) {
 			TOA_DBG("t4crt req: %p, tcp_wnd_clp: %u, wnd_clp: %u\n",
-				req, tcp_sk(sk)->window_clamp, req->window_clamp);
-			req->window_clamp = 65535U;
+				req, tcp_sk(sk)->window_clamp, req_wndclp);
+			req_wndclp = 65535U;
 			toa_found = get_toa_data(skb, &addr);
 			if (toa_found == TOA_IPV4_FOUND)
-				req->window_clamp = addr;
+				req_wndclp = addr;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+			reqsk_put(req);
+#endif
 		}
 	}
 
@@ -285,7 +333,7 @@ static inline int hook_toa_functions(void)
 	}
 
 	inet_stream_ops_p->getname = inet_getname_toa;
-	TOA_INFO("CPU [%u] hooked inet_getname <%p> --> <%p>\n",
+	TOA_INFO("CPU [%u] hooked inet_getname <%pK> --> <%pK>\n",
 		smp_processor_id(), inet_getname,
 		inet_stream_ops_p->getname);
 
@@ -303,12 +351,12 @@ static inline int hook_toa_functions(void)
 	}
 
 	ipv4_specific_p->syn_recv_sock = tcp_v4_syn_recv_sock_toa;
-	TOA_INFO("CPU [%u] hooked tcp_v4_syn_recv_sock <%p> --> <%p>\n",
+	TOA_INFO("CPU [%u] hooked tcp_v4_syn_recv_sock <%pK> --> <%pK>\n",
 		smp_processor_id(), tcp_v4_syn_recv_sock,
 		ipv4_specific_p->syn_recv_sock);
 
 	ipv4_specific_p->conn_request = tcp_v4_conn_request_toa;
-	TOA_INFO("CPU [%u] hooked tcp_v4_conn_request <%p> --> <%p>\n",
+	TOA_INFO("CPU [%u] hooked tcp_v4_conn_request <%pK> --> <%pK>\n",
 		smp_processor_id(), tcp_v4_conn_request,
 		ipv4_specific_p->conn_request);
 
@@ -409,28 +457,25 @@ static int toa_stats_seq_open(struct inode *inode, struct file *file)
 	return single_open(file, toa_stats_show, NULL);
 }
 
-static const struct file_operations toa_stats_fops = {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
+static const struct file_operations toa_stats_ops = {
 	.owner = THIS_MODULE,
 	.open = toa_stats_seq_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
 };
-
-/* TOA module init and destory */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
-static struct proc_dir_entry *proc_net_fops_create(struct net *net,
-	const char *name, mode_t mode, const struct file_operations *fops)
-{
-	return proc_create(name, mode, net->proc_net, fops);
-}
-
-static void proc_net_remove(struct net *net, const char *name)
-{
-	remove_proc_entry(name, net->proc_net);
-}
+#else
+static const struct proc_ops toa_stats_ops = {
+	.proc_open = toa_stats_seq_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
+/* TOA module init and destory */
 int kln_lookup(void *data, const char *name, struct module *mod,
 			   unsigned long addr)
 {
@@ -441,13 +486,18 @@ int kln_lookup(void *data, const char *name, struct module *mod,
 
 	return 0;
 }
+#endif
 
 static int toa_get_symbols(void){
-	if (kallsyms_lookup_name) {
-		ptr_kallsyms_lookup_name = kallsyms_lookup_name;
-	} else {
-		kallsyms_on_each_symbol(kln_lookup, NULL);
-	}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
+	kallsyms_on_each_symbol(kln_lookup, NULL);
+#elif  LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
+	ptr_kallsyms_lookup_name = kallsyms_lookup_name;
+#else
+	register_kprobe(&kp);
+	ptr_kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
+	unregister_kprobe(&kp);
+#endif
 
 	if (WARN_ON(!ptr_kallsyms_lookup_name)) {
 		pr_err("ptr_kallsyms_lookup_name is NULL\n");
@@ -483,8 +533,8 @@ static int __init toa_init(void)
 	if (!ext_stats)
 		return -ENOMEM;
 
-	if (!proc_net_fops_create(&init_net, "toa_stats",
-				  0, &toa_stats_fops)) {
+	proc_toa_stat = proc_create("toa_stats", 0444, init_net.proc_net, &toa_stats_ops);
+	if (!proc_toa_stat) {
 		TOA_INFO("cannot create proc.\n");
 		ret = -ENOMEM;
 		goto free_stats;
@@ -503,8 +553,7 @@ static int __init toa_init(void)
 unhook:
 	unhook_toa_functions();
 	synchronize_net();
-
-	proc_net_remove(&init_net, "toa_stats");
+	remove_proc_entry("toa_stats", init_net.proc_net);
 
 free_stats:
 	if (ext_stats) {
@@ -522,8 +571,7 @@ static void __exit toa_exit(void)
 
 	unhook_toa_functions();
 	synchronize_net();
-
-	proc_net_remove(&init_net, "toa_stats");
+	remove_proc_entry("toa_stats", init_net.proc_net);
 
 	if (ext_stats) {
 		free_percpu(ext_stats);
