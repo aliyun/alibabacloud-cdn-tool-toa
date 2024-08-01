@@ -3,3 +3,6 @@
 
 2024-07-24 Version: 2.0.0
 - Add support kernel version from 2.6.32 to 5.10.134
+
+2024-10-11 Version: 3.0.0
+- Add support toa parse by ebpf
